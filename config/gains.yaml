@@ -1,0 +1,66 @@
+# PID Gains and Parameters for Glider GNC
+
+# 1. Gain Scheduling (Adaptive Control)
+gain_schedules:
+  cruise:
+    min_alt_agl: 200.0
+    heading_kp: 5.0
+    heading_ki: 0.05
+    heading_kd: 0.5
+  approach:
+    min_alt_agl: 50.0
+    heading_kp: 10.0
+    heading_ki: 0.1
+    heading_kd: 1.0
+  final:
+    min_alt_agl: 0.0
+    heading_kp: 20.0
+    heading_ki: 0.2
+    heading_kd: 2.0
+
+  integral_limit: 10.0
+
+# 3. L1 Lateral Guidance
+l1_guidance:
+  period: 20.0           # L1 period in seconds (tunable)
+  damping: 0.7           # L1 damping ratio
+  max_bank_angle_deg: 35.0 # hard limit on commanded bank angle
+
+# 4. Airframe Parameters
+airframe:
+  glide_ratio: 5.0       # Va / Vsink
+  nominal_airspeed: 15.0 # m/s (Va)
+  turn_rate_constant: 1.0 # arbitrary scaling if needed
+
+# 5. Servo Constraints
+servos:
+  min_pwm_deg: 60.0
+  max_pwm_deg: 120.0
+  neutral_deg: 90.0
+  left_elevon_trim: 0.0
+  right_elevon_trim: 0.0
+
+# 6. Estimation Parameters
+estimation:
+  attitude_alpha: 0.98   # Complementary filter alpha
+  wind_rls_lambda: 0.98  # Recursive Least Squares forgetting factor
+
+# 7. Altitude Budget
+altitude_budget:
+  s_turn_excess_threshold: 15.0 # meters of excess alt to trigger S-turns
+  s_turn_bank_angle_deg: 20.0   # bank angle to command during S-turns
+
+# 8. Loop Timing
+timing:
+  target_hz: 20
+
+# 9. Telemetry / Sensor Health
+telemetry:
+  gps_staleness_timeout_ms: 500  # PID fallback engages if GPS not updated within this window
+
+# 10. RL Policy
+rl:
+  onnx_model_path: models/sac_policy_6500000_16D.onnx
+  obs_dim: 16
+  action_dim: 2
+  inference_timeout_ms: 5        # Watchdog: fallback if single inference exceeds this
