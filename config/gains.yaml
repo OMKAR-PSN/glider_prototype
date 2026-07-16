@@ -64,3 +64,41 @@ rl:
   obs_dim: 16
   action_dim: 2
   inference_timeout_ms: 5        # Watchdog: fallback if single inference exceeds this
+
+# 11. GARUD HAT pin mapping from Schema_Draft_2.pdf
+hardware:
+  numbering: bcm
+  i2c:
+    bus: 1
+    sda_gpio: 2
+    scl_gpio: 3
+    pca9685_address: 0x40
+    ina219_address: 0x41       # Confirm jumper; many INA219 boards default to 0x40
+  spi0:
+    mosi_gpio: 10
+    miso_gpio: 9
+    sclk_gpio: 11
+    bno085:
+      cs_gpio: 5
+      rst_gpio: 6
+      int_gpio: 13
+      device: 1
+    bmp388:
+      cs_gpio: 22
+      int_gpio: 27
+      device: 0
+  servos:
+    oe_gpio: 4
+    left_channel: 0
+    right_channel: 1
+    drogue_channel: 2
+  lora:
+    port: /dev/serial0
+    baudrate: 9600
+    tx_gpio: 14
+    rx_gpio: 15
+    m0_gpio: 23
+    m1_gpio: 24
+    aux_gpio: 25
+  buzzer:
+    gpio: 16

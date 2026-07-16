@@ -1,26 +1,49 @@
-import serial
 from typing import Optional
+from hw_interface.pinmap import LORA_UART
 from .packet import TelemetryPacket
 
-class XBeeLink:
+try:
+    import serial
+except ImportError:
+    serial = None
+
+class LoRaLink:
     """
-    Serial transport class for XBee telemetry.
+    Serial transport class for the UART LoRa telemetry module on connector J3.
+
+    Schema_Draft_2.pdf routes:
+    - TX_Lora to GPIO14/TXD0
+    - RX_Lora to GPIO15/RXD0
+    - M0 to GPIO23
+    - M1 to GPIO24
+    - AUX to GPIO25
     """
-    def __init__(self, port: str, baudrate: int = 115200):
+    def __init__(self, port: str = LORA_UART.port, baudrate: int = LORA_UART.baudrate,
+                 m0_gpio: int | None = LORA_UART.m0_gpio,
+                 m1_gpio: int | None = LORA_UART.m1_gpio,
+                 aux_gpio: int | None = LORA_UART.aux_gpio):
         self.port = port
         self.baudrate = baudrate
-        self._serial: Optional[serial.Serial] = None
+        self.m0_gpio = m0_gpio
+        self.m1_gpio = m1_gpio
+        self.aux_gpio = aux_gpio
+        self._serial = None
 
     def connect(self):
-        """Connect to the XBee serial port."""
+        """Connect to the LoRa serial port."""
+        if serial is None:
+            print("pyserial is not installed; LoRa telemetry disabled.")
+            self._serial = None
+            return
+
         try:
             self._serial = serial.Serial(self.port, self.baudrate, timeout=1.0)
         except serial.SerialException as e:
-            print(f"Failed to connect to XBee on {self.port}: {e}")
+            print(f"Failed to connect to LoRa telemetry on {self.port}: {e}")
             self._serial = None
 
     def disconnect(self):
-        """Disconnect from the XBee serial port."""
+        """Disconnect from the LoRa serial port."""
         if self._serial and self._serial.is_open:
             self._serial.close()
 
@@ -54,3 +77,5 @@ class XBeeLink:
             print(f"Error receiving/parsing packet: {e}")
             
         return None
+
+XBeeLink = LoRaLink

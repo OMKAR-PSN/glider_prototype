@@ -15,6 +15,7 @@ from state_machine.flight_states import StateMachine, FlightState
 from sim.dynamics import GliderDynamics
 from sim.wind_model import WindModel
 from hw_interface.simulated_hardware import SimulatedHardware
+from hw_interface.real_hardware import RealHardware
 from estimation.wind_estimator import WindEstimatorRLS
 import yaml
 import numpy as np
@@ -71,6 +72,32 @@ class SITL_Servos:
     def write(self, left_pwm, right_pwm):
         self.hw.write_servos(left_pwm, right_pwm)
 
+class HW_IMU:
+    def __init__(self, hw):
+        self.hw = hw
+    def read(self):
+        imu = self.hw.read_imu()
+        return imu.accel_x, imu.accel_y, imu.accel_z, imu.gyro_p, imu.gyro_q, imu.gyro_r, imu.mag_x, imu.mag_y, imu.mag_z
+
+class HW_Baro:
+    def __init__(self, hw):
+        self.hw = hw
+    def read_altitude(self):
+        return self.hw.read_baro().altitude
+
+class HW_GPS:
+    def __init__(self, hw):
+        self.hw = hw
+    def read(self):
+        gps = self.hw.read_gps()
+        return gps.latitude, gps.longitude, gps.altitude, gps.ground_speed, gps.heading
+
+class HW_Servos:
+    def __init__(self, hw):
+        self.hw = hw
+    def write(self, left_pwm, right_pwm):
+        self.hw.write_servos(left_pwm, right_pwm)
+
 class DummyTelemetry:
     def send(self, packet):
         pass
@@ -104,7 +131,12 @@ class FlightComputer:
             self.servos = SITL_Servos(self.sim_hw)
         else:
             log.info("--> REAL FLIGHT Mode ACTIVE")
-            raise NotImplementedError("Real hardware stubs not yet wired up")
+            self.real_hw = RealHardware()
+            self.real_hw.initialize()
+            self.imu    = HW_IMU(self.real_hw)
+            self.baro   = HW_Baro(self.real_hw)
+            self.gps    = HW_GPS(self.real_hw)
+            self.servos = HW_Servos(self.real_hw)
 
         self.telemetry = DummyTelemetry()
 
