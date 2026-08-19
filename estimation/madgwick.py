@@ -1,3 +1,7 @@
+# RETAINED FOR REFERENCE ONLY
+# Not used in the active flight path — BNO085 provides built-in AHRS fusion
+# that replaces this filter on real hardware. Do not import from flight_computer.py.
+# Active in SITL simulation mode only (SimulatedHardware bypasses BNO085).
 import math
 from typing import Tuple
 
