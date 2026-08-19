@@ -1,4 +1,4 @@
-# PID Gains and Parameters for Glider GNC
+﻿# PID Gains and Parameters for Glider GNC
 
 # 1. Gain Scheduling (Adaptive Control)
 gain_schedules:
@@ -120,11 +120,11 @@ hardware:
 # 12. PCA9685 Servo Channel Map
 # No hardcoded channel numbers in any other file -- always read from here.
 servo_channels:
-  glider_left:    0    # MG995R -- left brake (asymmetric)
-  glider_right:   1    # MG995R -- right brake (asymmetric)
-  drogue_release: 2    # MG995R -- drogue release at 600m AGL
-  gimbal_roll:    3    # SG90   -- gimbal roll stabilisation
-  gimbal_pitch:   4    # SG90   -- gimbal pitch stabilisation
+  glider_left:    0    # EMAX ES3004 -- left brake (asymmetric)
+  glider_right:   1    # EMAX ES3004 -- right brake (asymmetric)
+  drogue_release: 2    # EMAX ES3004 -- drogue release at 600m AGL
+  gimbal_roll:    3    # MG90   -- gimbal roll stabilisation
+  gimbal_pitch:   4    # MG90   -- gimbal pitch stabilisation
 
 # 13. Servo PWM Parameters
 # PCA9685 outputs 50 Hz PWM. Pulse widths below are microsecond values.

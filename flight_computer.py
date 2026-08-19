@@ -27,15 +27,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Logging Setup
 # ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s %(message)s',
+    datefmt='%H:%M:%S'
+)
 log = logging.getLogger("FlightComputer")
-log.setLevel(logging.INFO)
-fh = logging.FileHandler("flight_computer.log")
-fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s', datefmt='%H:%M:%S'))
-# We specifically do NOT add a StreamHandler to the root logger here.
-# The FlightDashboard will handle console rendering. If rich is missing,
-# __main__ will attach a standard StreamHandler.
-logging.getLogger().setLevel(logging.INFO)
-logging.getLogger().addHandler(fh)
 
 # ---------------------------------------------------------------------------
 # Hardware Interface Stubs
@@ -104,17 +101,92 @@ class FlightComputer:
             self.servos = SITL_Servos(self.sim_hw)
         else:
             log.info("--> REAL FLIGHT Mode ACTIVE")
-            raise NotImplementedError("Real hardware stubs not yet wired up")
+            from sensors.drivers import BNO085, BMP388, GPS, INA219
+            from hw_interface.real_hardware import RealHardware
+            self._real_hw = RealHardware()
+            self._bno085  = BNO085()                  # SPI: CS=GPIO5, RST=GPIO6
+            self._bmp388  = BMP388(cs_pin_name='D22')  # SPI: CS=GPIO22
+            self._gps_hw  = GPS(
+                port='/dev/ttyAMA0',
+                baudrate=9600,
+            )
+            self._ina219  = INA219(address=0x41)
+
+            # Pre-flight calibration check -- wait for BNO085 to settle
+            log.info("[HW] Waiting for BNO085 to reach stable state...")
+            import time as _time
+            for _ in range(60):   # up to 30 seconds
+                if self._bno085.calibration_ok():
+                    log.info("[HW] BNO085 stable -- proceeding.")
+                    break
+                _time.sleep(0.5)
+            else:
+                log.warning("[HW] BNO085 calibration timeout -- proceeding anyway.")
+
+            # Thin wrappers so the rest of run() doesn't need special-casing
+            class _RealIMU:
+                def __init__(self_i, bno):
+                    self_i._bno = bno
+                def read(self_i):
+                    d = self_i._bno.read()
+                    if d is None:
+                        return (0, 0, 9.81, 0, 0, 0, 0, 0, 0)
+                    return (d.accel_x, d.accel_y, d.accel_z,
+                            d.gyro_p,  d.gyro_q,  d.gyro_r,
+                            d.mag_x,   d.mag_y,   d.mag_z)
+                def read_attitude(self_i):
+                    """Returns (roll, pitch, yaw, gz) directly from BNO085 fusion."""
+                    d = self_i._bno.read()
+                    if d is None:
+                        return 0.0, 0.0, 0.0, 0.0
+                    return d.roll, d.pitch, d.yaw, d.gyro_r
+
+            class _RealBaro:
+                def __init__(self_b, bmp):
+                    self_b._bmp = bmp
+                def read_altitude(self_b):
+                    d = self_b._bmp.read()
+                    return d.altitude if d else 0.0
+
+            class _RealGPS:
+                def __init__(self_g, gps):
+                    self_g._gps = gps
+                def read(self_g):
+                    d = self_g._gps.read()
+                    if d is None:
+                        return 0.0, 0.0, 0.0, 0.0, 0.0
+                    return d.latitude, d.longitude, d.altitude, d.ground_speed, d.heading
+
+            class _RealServos:
+                def __init__(self_s, hw):
+                    self_s._hw = hw
+                def write(self_s, left, right):
+                    self_s._hw.write_servos(left, right)
+
+            self.imu    = _RealIMU(self._bno085)
+            self.baro   = _RealBaro(self._bmp388)
+            self.gps    = _RealGPS(self._gps_hw)
+            self.servos = _RealServos(self._real_hw)
 
         self.telemetry = DummyTelemetry()
 
-        self.target_x = 0.0
-        self.target_y = 0.0
+        # Read mission target from config and convert to our 1e-5 projection
+        # Edit config/gains.yaml section 14 on launch day -- no code change needed.
+        with open("config/gains.yaml", "r") as _f:
+            _cfg = yaml.safe_load(_f)
+        mission_cfg = _cfg.get('mission', {})
+        target_lat  = mission_cfg.get('target_latitude',  18.5204)
+        target_lon  = mission_cfg.get('target_longitude', 73.8567)
+        self.target_x = target_lat / 1e-5
+        self.target_y = target_lon / 1e-5
+        log.info("[MISSION] Target: lat=%.6f lon=%.6f (x=%.0f y=%.0f)",
+                 target_lat, target_lon, self.target_x, self.target_y)
 
         self.att_filter     = MadgwickFilter(beta=0.1)
-        self.ekf_alt        = EKFAltitude(self.dt, initial_alt=self.baro.read_altitude())
+        _ground_alt         = self.baro.read_altitude()   # read ONCE — shared reference
+        self.ekf_alt        = EKFAltitude(self.dt, initial_alt=_ground_alt)
         self.heading_pid    = HeadingPID(kp=10.0, ki=0.1, kd=1.0, output_limit=30.0)
-        self.state_machine  = StateMachine(ground_altitude=0.0)
+        self.state_machine  = StateMachine(ground_altitude=_ground_alt)
         self.wind_estimator = WindEstimatorRLS()
         self.prev_delta_a   = 0.0
         self.prev_delta_s   = 0.0
@@ -177,24 +249,12 @@ class FlightComputer:
 
     def _obs_from_state(self, curr_x, curr_y, target_bearing, dist,
                         alt_excess, pitch, roll, yaw_rate,
-                        gps_speed, gps_heading, altitude,
-                        aircraft_heading):
+                        gps_speed, gps_heading, altitude):
         """
         16D observation builder. Must match training/env.py _get_obs() exactly.
-
-        Angle convention (verified against env.py):
-          aircraft_heading : body-frame yaw (where the nose points) — from attitude filter.
-                             Used for heading_err (obs[0-1]) only.
-          gps_heading      : course-over-ground (where the glider is actually moving,
-                             including wind drift) — from GPS ground track.
-                             Used for track_err (obs[12-13]) and lateral_drift (obs[14]).
-          These are equal in zero-wind; they diverge in crosswind conditions, which is
-          exactly the information obs[0-1] vs obs[12-13] encodes for the agent.
-
         obs[15] time_to_impact is capped at 2.0 (preserved from env.py line 116).
         """
-        # obs[0-1]: heading_err — gap between nose direction and target bearing
-        heading_err = (target_bearing - aircraft_heading + math.pi) % (2 * math.pi) - math.pi
+        heading_err = (target_bearing - gps_heading + math.pi) % (2 * math.pi) - math.pi
 
         wx, wy = self.wind_estimator.get_wind_estimate()
         wind_speed = math.hypot(wx, wy)
@@ -257,7 +317,7 @@ class FlightComputer:
             raise RuntimeError(f"Inference timeout: {elapsed*1000:.1f}ms > {self.inference_timeout_s*1000:.0f}ms")
         return raw
 
-    def run(self, dashboard=None):
+    def run(self):
         log.info("Starting 20Hz Flight Loop...")
         frame_id = 0
 
@@ -307,10 +367,6 @@ class FlightComputer:
             left_servo  = 90.0
             right_servo = 90.0
             controller_used = "NEUTRAL"
-            rl_succeeded = False
-            delta_a = 0.0
-            delta_s = 0.0
-            obs = None
 
             if state == FlightState.GUIDED_DESCENT:
                 aim_x = self.target_x
@@ -319,13 +375,13 @@ class FlightComputer:
                 dist       = math.hypot(aim_x - curr_x, aim_y - curr_y)
                 alt_excess = self.ekf_alt.altitude - (dist / self.glide_ratio)
 
+                rl_succeeded = False
                 if self.rl_active and gps_fresh:
                     try:
                         obs = self._obs_from_state(
                             curr_x, curr_y, target_bearing, dist, alt_excess,
                             pitch, roll, gz,
-                            gps_speed, gps_heading, self.ekf_alt.altitude,
-                            aircraft_heading=yaw
+                            gps_speed, gps_heading, self.ekf_alt.altitude
                         )
                         raw     = self._rl_inference(obs)
                         delta_a, delta_s = self._validate_and_rescale(raw)
@@ -365,21 +421,12 @@ class FlightComputer:
                       f"{math.degrees(roll):.1f},{math.degrees(pitch):.1f},{math.degrees(yaw):.1f}")
             self.telemetry.send(packet)
 
-            if dashboard:
-                wx, wy = self.wind_estimator.get_wind_estimate()
-                dashboard.update(
-                    state_name=state.name,
-                    controller=controller_used,
-                    baro_alt=baro_alt,
-                    dist=math.hypot(curr_x - self.target_x, curr_y - self.target_y),
-                    roll=roll, pitch=pitch, yaw=yaw,
-                    gps_speed=gps_speed, gps_heading=gps_heading,
-                    wind_speed=math.hypot(wx, wy),
-                    wind_dir=math.atan2(wy, wx),
-                    left_servo=left_servo, right_servo=right_servo,
-                    delta_a=delta_a if state == FlightState.GUIDED_DESCENT else 0.0,
-                    delta_s=delta_s if state == FlightState.GUIDED_DESCENT else 0.0,
-                    obs=obs if rl_succeeded else None
+            if frame_id % 20 == 0:
+                log.info(
+                    f"[{controller_used:<3}] STATE:{state.name:<22} | "
+                    f"ALT:{baro_alt:>6.1f}m | "
+                    f"DIST:{math.hypot(curr_x - self.target_x, curr_y - self.target_y):>7.1f}m | "
+                    f"SRV L:{left_servo:>5.1f} R:{right_servo:>5.1f}"
                 )
 
             # 6. Loop timing enforcement
@@ -397,22 +444,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CAN-7U-SAT Flight Computer")
     parser.add_argument("--sitl", action="store_true", help="Run in SITL mode")
     args = parser.parse_args()
-    
-    from telemetry.dashboard import FlightDashboard
-    dashboard = FlightDashboard()
-    
-    if not dashboard.enabled:
-        # Fallback to standard console logging if rich is not installed
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s', datefmt='%H:%M:%S'))
-        logging.getLogger().addHandler(ch)
-        
     fc = FlightComputer(use_simulator=args.sitl)
-    
-    dashboard.start()
     try:
-        fc.run(dashboard=dashboard)
+        fc.run()
     except KeyboardInterrupt:
         log.info("Flight Computer shutdown safely.")
-    finally:
-        dashboard.stop()

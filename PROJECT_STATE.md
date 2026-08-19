@@ -1,4 +1,29 @@
-# Glider GNC Project State & Audit
+﻿# Glider GNC Project State & Audit
+
+## Hardware Corrections (2026-07-21)
+| Item | Was assumed | Actual confirmed |
+|---|---|---|
+| IMU | ICM-20948 via SPI | **BNO085 via I2C (0x4A)** |
+| Madgwick filter | Active in flight path | **Retired from real-hw path — BNO085 AHRS replaces it** |
+| Barometers | BMP388 ×1 I2C 0x77 | **BMP388 ×2 I2C 0x76 (primary) + 0x77 (secondary), median vote** |
+| Servo driver | GPIO pins (pigpio) | **PCA9685 I2C via adafruit ServoKit** |
+| IMU/Power address conflict | Not flagged | **INA219 0x40 vs PCA9685 0x40 — must resolve physically; documented in gains.yaml** |
+
+### Resolved PCA9685 channel map
+| Channel | Servo | Role |
+|---|---|---|
+| 0 | EMAX ES3004 | Left brake (asymmetric) |
+| 1 | EMAX ES3004 | Right brake (asymmetric) |
+| 2 | EMAX ES3004 | Drogue release at 600m AGL |
+| 3 | 28BYJ-48 | Gimbal roll stabilisation |
+| 4 | MG90 | Gimbal pitch stabilisation |
+
+### Files changed by this correction
+- `sensors/drivers.py` — BNO085 (I2C), dual BMP388 (I2C), NEO-M8N GPS, INA219 real drivers
+- `hw_interface/real_hardware.py` — PCA9685 ServoKit, config-driven channel map
+- `estimation/madgwick.py` — marked "RETAINED FOR REFERENCE ONLY"
+- `flight_computer.py` — real-hw path reads BNO085 Euler angles directly (no Madgwick call); A6 calibration check added
+- `config/gains.yaml` — sections 11 (hardware) and 12 (servo_channels) added
 
 ## Changelog / History of Major Fixes
 - **Reachability Filter:** Added to `scenario_validator.py` to prevent evaluating drops that are physically impossible to reach due to high headwinds or distance.
