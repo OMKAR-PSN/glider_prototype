@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from utils.helpers import HardwareError   # raises on sensor failure
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -34,18 +36,19 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IMUData:
     """Fused attitude + raw inertial data from BNO085."""
-    roll:    float
-    pitch:   float
-    yaw:     float
-    gyro_p:  float
-    gyro_q:  float
-    gyro_r:  float
-    accel_x: float
-    accel_y: float
-    accel_z: float
-    mag_x:   float
-    mag_y:   float
-    mag_z:   float
+    roll:               float
+    pitch:              float
+    yaw:                float
+    gyro_p:             float
+    gyro_q:             float
+    gyro_r:             float
+    accel_x:            float
+    accel_y:            float
+    accel_z:            float
+    mag_x:              float
+    mag_y:              float
+    mag_z:              float
+    calibration_status: int = 0   # BNO085 calibration level (0=uncal, 3=fully cal)
 
 
 @dataclass
@@ -110,42 +113,32 @@ class BNO085:
             )
             from adafruit_bno08x.spi import BNO08X_SPI
 
-            spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
-            cs  = digitalio.DigitalInOut(board.D5)    # CS_BNO  = GPIO5
-            rst = digitalio.DigitalInOut(board.D6)    # RST_BNO = GPIO6
-            # INT_BNO = GPIO27 — available for interrupt-driven mode
-            self._bno = BNO08X_SPI(spi, cs, reset=rst)
+            spi       = busio.SPI(board.SCK, board.MOSI, board.MISO)
+            cs        = digitalio.DigitalInOut(board.D5)    # CS_BNO  = GPIO5
+            interrupt = digitalio.DigitalInOut(board.D27)   # INT_BNO = GPIO27
+            reset     = digitalio.DigitalInOut(board.D6)    # RST_BNO = GPIO6
+            self._bno = BNO08X_SPI(spi, cs, interrupt, reset)  # same as GARUD repo
             self._bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
             self._bno.enable_feature(BNO_REPORT_GYROSCOPE)
             self._bno.enable_feature(BNO_REPORT_LINEAR_ACCELERATION)
             self._bno.enable_feature(BNO_REPORT_MAGNETOMETER)
-            self._simulated = False
-            logger.info("BNO085 initialised over SPI (CS=GPIO5, RST=GPIO6).")
-        except Exception as e:
-            logger.warning("BNO085 SPI init failed (%s) -- using simulated data.", e)
-            self._simulated = True
+            logger.info("BNO085 initialised over SPI (CS=GPIO5, INT=GPIO27, RST=GPIO6).")
+        except Exception as exc:
+            raise HardwareError(
+                f"BNO085 not detected on SPI (CS=GPIO5, INT=GPIO27, RST=GPIO6): {exc}"
+            ) from exc
 
     def calibration_ok(self, min_level: int = 2) -> bool:
         """
-        Returns True when the sensor has settled enough to arm.
+        Returns True when the sensor stability is in a known-good state.
         Uses stability_classification (only exposed quality metric in this library).
-        min_level kept for API compatibility but ignored.
         """
-        if self._simulated:
-            return True
         try:
             return self._bno.stability_classification in self._STABLE_STATES
         except Exception:
             return False
 
     def read(self) -> Optional[IMUData]:
-        if self._simulated:
-            return IMUData(
-                roll=0.0, pitch=0.0, yaw=0.0,
-                gyro_p=0.0, gyro_q=0.0, gyro_r=0.0,
-                accel_x=0.0, accel_y=0.0, accel_z=9.81,
-                mag_x=0.0, mag_y=0.0, mag_z=0.0,
-            )
         try:
             qi, qj, qk, qr = self._bno.quaternion
 
@@ -164,16 +157,17 @@ class BNO085:
             gx, gy, gz = self._bno.gyro
             ax, ay, az = self._bno.linear_acceleration
             mx, my, mz = self._bno.magnetic
+            cal_status = getattr(self._bno, "calibration_status", 0) or 0
 
             return IMUData(
                 roll=roll, pitch=pitch, yaw=yaw,
                 gyro_p=gx, gyro_q=gy, gyro_r=gz,
                 accel_x=ax, accel_y=ay, accel_z=az,
                 mag_x=mx, mag_y=my, mag_z=mz,
+                calibration_status=cal_status,
             )
-        except Exception as e:
-            logger.error("BNO085 read error: %s", e)
-            return None
+        except Exception as exc:
+            raise HardwareError(f"BNO085 read failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -210,29 +204,25 @@ class BMP388:
             self._bmp = adafruit_bmp3xx.BMP3XX_SPI(spi, cs)
             self._bmp.pressure_oversampling    = 8
             self._bmp.temperature_oversampling = 2
-            self._simulated  = False
             self._ground_alt = self._bmp.altitude
             logger.info(
-                "BMP388 (SPI, CS=%s / GPIO22) initialised. Ground ref %.1f m MSL.",
+                "BMP388 (SPI, CS=%s/GPIO22) initialised. Ground ref %.1f m MSL.",
                 cs_pin_name, self._ground_alt,
             )
-        except Exception as e:
-            logger.warning("BMP388 init failed (%s) -- using simulated data.", e)
-            self._simulated  = True
-            self._ground_alt = 0.0
+        except Exception as exc:
+            raise HardwareError(
+                f"BMP388 not detected on SPI (CS={cs_pin_name}/GPIO22): {exc}"
+            ) from exc
 
     def read(self) -> Optional[BaroData]:
-        if self._simulated:
-            return BaroData(pressure=1013.25, temperature=25.0, altitude=0.0)
         try:
             return BaroData(
-                pressure=self._bmp.pressure,
-                temperature=self._bmp.temperature,
-                altitude=self._bmp.altitude - self._ground_alt,
+                pressure    = self._bmp.pressure,
+                temperature = self._bmp.temperature,
+                altitude    = self._bmp.altitude - self._ground_alt,
             )
-        except Exception as e:
-            logger.error("BMP388 read error: %s", e)
-            return None
+        except Exception as exc:
+            raise HardwareError(f"BMP388 read failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
