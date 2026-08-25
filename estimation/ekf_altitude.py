@@ -77,3 +77,21 @@ class EKFAltitude:
     @property
     def vertical_velocity(self) -> float:
         return float(self.x[1, 0])
+
+    def set_altitude(self, altitude: float, velocity: float = 0.0) -> None:
+        """
+        Seed the EKF state directly — used by reset recovery.
+
+        Called at boot when a valid .state snapshot exists, so the filter
+        starts from the last known position instead of re-converging from zero.
+        Also resets covariance to a moderate uncertainty (not zero, since the
+        values come from a crashed state, not a fresh measurement).
+
+        Args:
+            altitude: Last known AGL altitude (metres)
+            velocity: Last known vertical velocity (m/s), negative = descending
+        """
+        self.x = np.array([[altitude], [velocity]])
+        # Moderate covariance — we trust the saved value but it may be stale
+        self.P = np.array([[25.0, 0.0],
+                           [0.0,  4.0]])
