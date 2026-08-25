@@ -398,34 +398,61 @@ class BuzzerDriver:
     Schematic: GPIO16 -> 220 ohm resistor -> base of 2N2219 NPN transistor -> BZ1.
     Driving GPIO16 HIGH energises the buzzer.
 
+    Compatibility:
+      Pi 4 : uses RPi.GPIO
+      Pi 5 : uses lgpio  (RPi.GPIO does not support Pi 5 RP1 chip)
+
     Beep patterns:
       arm_confirmation     -- 3 short beeps (system armed, all sensors green)
       recovery_beacon      -- 1 long + 2 short (glider on ground, find me)
-      gps_dropout_warning  -- 1 long beep     (GPS stale, PID fallback active)
-      pid_fallback_warning -- 2 short beeps   (RL watchdog fired)
+      gps_dropout_warning  -- 1 long beep     (GPS stale, AGC fallback active)
+      agc_fallback_warning -- 2 short beeps   (RL watchdog fired)
     """
 
     def __init__(self, gpio_pin: int = 16) -> None:
         self._pin = gpio_pin
+        self._mode = None  # 'lgpio' | 'rpigpio' | None (disabled)
+
+        # Try lgpio first (Pi 5)
+        try:
+            import lgpio
+            self._h = lgpio.gpiochip_open(0)
+            lgpio.gpio_claim_output(self._h, gpio_pin, 0)
+            self._lgpio = lgpio
+            self._mode = "lgpio"
+            logger.info("BuzzerDriver (lgpio, Pi 5) initialised on GPIO%d.", gpio_pin)
+            return
+        except Exception:
+            pass
+
+        # Fallback: RPi.GPIO (Pi 4)
         try:
             import RPi.GPIO as GPIO
             self._GPIO = GPIO
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(gpio_pin, GPIO.OUT, initial=GPIO.LOW)
-            self._simulated = False
-            logger.info("BuzzerDriver initialised on GPIO%d.", gpio_pin)
-        except Exception as e:
-            logger.warning("BuzzerDriver init failed (%s) -- buzzer disabled.", e)
-            self._simulated = True
+            self._mode = "rpigpio"
+            logger.info("BuzzerDriver (RPi.GPIO, Pi 4) initialised on GPIO%d.", gpio_pin)
+            return
+        except Exception:
+            pass
+
+        logger.warning("BuzzerDriver: no GPIO library available -- buzzer disabled.")
 
     def _beep(self, on_s: float, off_s: float = 0.1, count: int = 1) -> None:
-        if self._simulated:
+        if self._mode is None:
             return
         for _ in range(count):
-            self._GPIO.output(self._pin, self._GPIO.HIGH)
+            self._gpio_set(1)
             time.sleep(on_s)
-            self._GPIO.output(self._pin, self._GPIO.LOW)
+            self._gpio_set(0)
             time.sleep(off_s)
+
+    def _gpio_set(self, value: int) -> None:
+        if self._mode == "lgpio":
+            self._lgpio.gpio_write(self._h, self._pin, value)
+        elif self._mode == "rpigpio":
+            self._GPIO.output(self._pin, value)
 
     def arm_confirmation(self) -> None:
         """3 short beeps -- system armed, all sensors green."""
@@ -437,14 +464,23 @@ class BuzzerDriver:
         self._beep(on_s=0.15, off_s=0.15, count=2)
 
     def gps_dropout_warning(self) -> None:
-        """1 long beep -- GPS is stale, PID fallback engaged."""
+        """1 long beep -- GPS is stale, AGC fallback engaged."""
         self._beep(on_s=0.80, off_s=0.10, count=1)
 
-    def pid_fallback_warning(self) -> None:
-        """2 short beeps -- RL watchdog fired, falling back to PID."""
+    def agc_fallback_warning(self) -> None:
+        """2 short beeps -- RL watchdog fired, falling back to AGC."""
         self._beep(on_s=0.15, off_s=0.15, count=2)
 
     def cleanup(self) -> None:
         """Release GPIO resources."""
-        if not self._simulated:
-            self._GPIO.cleanup(self._pin)
+        if self._mode == "lgpio":
+            try:
+                self._lgpio.gpiochip_close(self._h)
+            except Exception:
+                pass
+        elif self._mode == "rpigpio":
+            try:
+                self._GPIO.cleanup(self._pin)
+            except Exception:
+                pass
+
