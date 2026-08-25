@@ -12,6 +12,10 @@ from estimation.madgwick import MadgwickFilter
 from estimation.ekf_altitude import EKFAltitude
 from guidance.heading_pid import HeadingPID
 from state_machine.flight_states import StateMachine, FlightState
+from state_machine.state_persistence import (
+    StateSnapshot, STATE_WRITE_INTERVAL_S,
+    write_state, load_state, delete_state,
+)
 from sim.dynamics import GliderDynamics
 from sim.wind_model import WindModel
 from hw_interface.simulated_hardware import SimulatedHardware
@@ -191,7 +195,31 @@ class FlightComputer:
         self.prev_delta_a   = 0.0
         self.prev_delta_s   = 0.0
 
-        self._last_gps_time = time.time()
+        self._last_gps_time   = time.time()
+        self._last_state_write = time.time()   # throttle .state writes
+
+        # ---------------------------------------------------------------
+        # Boot-time reset recovery
+        # ---------------------------------------------------------------
+        if not self.use_simulator:
+            snapshot = load_state()
+            if snapshot is not None:
+                log.warning("[RECOVERY] Resuming from .state: state=%s  drogue=%s  alt=%.1f m",
+                            snapshot.flight_state, snapshot.drogue_fired,
+                            snapshot.last_altitude_m)
+                # Re-seed the state machine to the recovered state
+                self.state_machine.force_state(snapshot.flight_state)
+                # Safety: lock out drogue if it was already fired
+                if snapshot.drogue_fired:
+                    self.state_machine.lock_drogue()
+                    log.warning("[RECOVERY] Drogue LOCKED OUT — was fired before reset.")
+                # Seed EKF with last known altitude so estimates are sane
+                self.ekf_alt.set_altitude(snapshot.last_altitude_m,
+                                          snapshot.last_velocity_ms)
+                log.info("[RECOVERY] EKF seeded: alt=%.1f m  vel=%.2f m/s",
+                         snapshot.last_altitude_m, snapshot.last_velocity_ms)
+            else:
+                log.info("[BOOT] Cold start — no valid .state file.")
 
         with open("config/gains.yaml", "r") as f:
             self.config = yaml.safe_load(f)
@@ -292,6 +320,24 @@ class FlightComputer:
             time_to_impact_norm,       # obs[15]
         ]], dtype=np.float32)
 
+    def _write_state_snapshot(self) -> None:
+        """Write current flight state to .state file for reset recovery."""
+        try:
+            sm = self.state_machine
+            snapshot = StateSnapshot(
+                flight_state      = sm.state.name,
+                ground_altitude_m = sm.ground_altitude,
+                drogue_fired      = sm.drogue_fired,
+                last_altitude_m   = self.ekf_alt.altitude,
+                last_velocity_ms  = self.ekf_alt.vertical_velocity,
+                target_lat        = self.target_x * 1e-5,
+                target_lon        = self.target_y * 1e-5,
+                rl_active         = self.rl_active,
+            )
+            write_state(snapshot)
+        except Exception as e:
+            log.warning("[STATE] Failed to write snapshot: %s", e)
+
     def _validate_and_rescale(self, raw):
         """
         Rescales raw tanh outputs to physical units and validates.
@@ -331,6 +377,11 @@ class FlightComputer:
                     log.info("--> Simulation Finished. Glider has landed.")
                     break
 
+            # -- Periodic .state write (every STATE_WRITE_INTERVAL_S seconds)
+            now = time.time()
+            if not self.use_simulator and (now - self._last_state_write) >= STATE_WRITE_INTERVAL_S:
+                self._write_state_snapshot()
+                self._last_state_write = now
             # 1. Read Sensors
             ax, ay, az, gx, gy, gz, mx, my, mz = self.imu.read()
             baro_alt = self.baro.read_altitude()
