@@ -2,7 +2,7 @@
 GARUD HAT pin mapping from Schema_Draft_2.pdf.
 
 Numbering uses Broadcom GPIO numbers, not physical header pin numbers.
-The HAT routes BNO085 and BMP388 over SPI0, PCA9685 and INA219 over I2C1,
+The HAT routes BMP388 over SPI0, BNO085, PCA9685 and INA219 over I2C1,
 LoRa telemetry over UART0, and a transistor-driven buzzer on GPIO16.
 """
 
@@ -45,8 +45,8 @@ SPI0_MISO_GPIO = 9
 SPI0_SCLK_GPIO = 11
 
 # Sensors.
-BNO085_SPI = SpiDevicePins(bus=SPI0_BUS, device=1, cs_gpio=5, int_gpio=13, rst_gpio=6)
-BMP388_SPI = SpiDevicePins(bus=SPI0_BUS, device=0, cs_gpio=22, int_gpio=27)
+BNO085_I2C = I2cDevicePins(bus=I2C1_BUS, address=0x4A)
+BMP388_SPI = SpiDevicePins(bus=SPI0_BUS, device=0, cs_gpio=8)
 
 # I2C devices. Verify one of these addresses is changed on hardware if both
 # modules are populated, because many PCA9685 and INA219 breakouts default to 0x40.

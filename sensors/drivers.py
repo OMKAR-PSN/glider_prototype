@@ -2,8 +2,8 @@
 sensors/drivers.py — GARUD HAT hardware drivers (schematic confirmed Rev 2)
 
 Hardware map (all confirmed from GARUD HAT Rev 2 schematic):
-  BNO085   : SPI0, CS=GPIO5 (D5), RST=GPIO6 (D6), INT=GPIO27 (D27)
-  BMP388   : SPI0, CS=GPIO22 (D22), INT=GPIO17 (D17)  [shared SPI bus]
+  BNO085   : I2C, address 0x4A
+  BMP388   : SPI0, CS=GPIO8 (D8)
   INA219   : I2C, address 0x41 (ADDR pin to VCC, schematic U4)
   PCA9685  : I2C, address 0x40 (A0-A5 all to GND), OE=GPIO4
   GPS      : UART /dev/ttyAMA0 (GPIO14=TX, GPIO15=RX)
@@ -78,18 +78,15 @@ class PowerData:
 
 
 # ---------------------------------------------------------------------------
-# BNO085 -- Attitude / IMU (SPI0, GARUD HAT Rev 2)
+# BNO085 -- Attitude / IMU (I2C)
 # ---------------------------------------------------------------------------
 
 class BNO085:
     """
-    AHRS driver for the BNO085 over SPI (GARUD HAT Rev 2).
+    AHRS driver for the BNO085 over I2C (GARUDA HAT configuration).
 
     Library  : adafruit-circuitpython-bno08x
-    Interface: SPI0 shared bus
-      CS  = GPIO5  (board.D5,  Pi pin 29)
-      RST = GPIO6  (board.D6,  Pi pin 31)
-      INT = GPIO27 (board.D27, Pi pin 13) -- used for interrupt-driven reads
+    Interface: I2C1 shared bus (SDA=GPIO2, SCL=GPIO3, addr=0x4A)
 
     Install:
       pip install adafruit-circuitpython-bno08x
@@ -111,21 +108,18 @@ class BNO085:
                 BNO_REPORT_LINEAR_ACCELERATION,
                 BNO_REPORT_MAGNETOMETER,
             )
-            from adafruit_bno08x.spi import BNO08X_SPI
+            from adafruit_bno08x.i2c import BNO08X_I2C
 
-            spi       = busio.SPI(board.SCK, board.MOSI, board.MISO)
-            cs        = digitalio.DigitalInOut(board.D5)    # CS_BNO  = GPIO5
-            interrupt = digitalio.DigitalInOut(board.D27)   # INT_BNO = GPIO27
-            reset     = digitalio.DigitalInOut(board.D6)    # RST_BNO = GPIO6
-            self._bno = BNO08X_SPI(spi, cs, interrupt, reset)  # same as GARUD repo
+            i2c = busio.I2C(board.SCL, board.SDA)
+            self._bno = BNO08X_I2C(i2c, address=0x4A)
             self._bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
             self._bno.enable_feature(BNO_REPORT_GYROSCOPE)
             self._bno.enable_feature(BNO_REPORT_LINEAR_ACCELERATION)
             self._bno.enable_feature(BNO_REPORT_MAGNETOMETER)
-            logger.info("BNO085 initialised over SPI (CS=GPIO5, INT=GPIO27, RST=GPIO6).")
+            logger.info("BNO085 initialised over I2C (address 0x4A).")
         except Exception as exc:
             raise HardwareError(
-                f"BNO085 not detected on SPI (CS=GPIO5, INT=GPIO27, RST=GPIO6): {exc}"
+                f"BNO085 not detected on I2C (address 0x4A): {exc}"
             ) from exc
 
     def calibration_ok(self, min_level: int = 2) -> bool:
@@ -171,17 +165,16 @@ class BNO085:
 
 
 # ---------------------------------------------------------------------------
-# BMP388 -- Barometer (SPI0, CS = GPIO22, GARUD HAT Rev 2)
+# BMP388 -- Barometer (SPI0, CS = GPIO8, GARUD HAT)
 # ---------------------------------------------------------------------------
 
 class BMP388:
     """
-    Barometric altitude driver for the BMP388 over SPI (GARUD HAT Rev 2).
+    Barometric altitude driver for the BMP388 over SPI.
 
     Library  : adafruit-circuitpython-bmp3xx
     Interface: SPI0 shared bus
-      CS  = GPIO22 (board.D22, Pi pin 15)
-      INT = GPIO17 (board.D17, Pi pin 11) -- not polled, interrupt available
+      CS  = GPIO8 (board.D8)
 
     NOTE: BMP388 and BNO085 share the same SPI bus (GPIO11/10/9).
           CS lines are separate — only one is asserted at a time.
@@ -192,7 +185,7 @@ class BMP388:
     AGL altitude is zeroed at object construction (launch-pad level).
     """
 
-    def __init__(self, cs_pin_name: str = "D22") -> None:
+    def __init__(self, cs_pin_name: str = "D8") -> None:
         try:
             import board
             import busio
@@ -206,12 +199,12 @@ class BMP388:
             self._bmp.temperature_oversampling = 2
             self._ground_alt = self._bmp.altitude
             logger.info(
-                "BMP388 (SPI, CS=%s/GPIO22) initialised. Ground ref %.1f m MSL.",
+                "BMP388 (SPI, CS=%s/GPIO8) initialised. Ground ref %.1f m MSL.",
                 cs_pin_name, self._ground_alt,
             )
         except Exception as exc:
             raise HardwareError(
-                f"BMP388 not detected on SPI (CS={cs_pin_name}/GPIO22): {exc}"
+                f"BMP388 not detected on SPI (CS={cs_pin_name}/GPIO8): {exc}"
             ) from exc
 
     def read(self) -> Optional[BaroData]:
