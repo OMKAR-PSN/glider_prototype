@@ -1,44 +1,30 @@
 """
 state_machine/state_persistence.py
 ====================================
-Payload reset recovery mechanism for GARUD GNC.
+Payload reset recovery mechanism for GARUD GNC (Python / Raspberry Pi 5).
 
-Concept ported from payload flight computer (Arduino/Teensy) state logging,
-extended with actual boot-time recovery so the Pi can resume mid-flight
-after a crash or power glitch.
+Ported from the GARUD payload flight computer (Teensy 4.1, Arduino C++) —
+specifically the dual-slot A/B recovery pattern in saveRecoveryState() /
+attemptRecovery().
 
-How it works
-------------
-1. Every STATE_WRITE_INTERVAL_S seconds, `write_state()` saves a snapshot
-   of critical flight variables to `.state` file on disk.
-2. On hard state transitions (drogue fired, etc.), `write_state()` is called
-   immediately regardless of interval.
-3. At boot, `load_state()` reads the file. If the timestamp is within
-   MAX_STATE_AGE_S seconds, the system resumes from the saved state instead
-   of starting from BOOT.
+How the dual-slot A/B pattern works (same as Arduino)
+------------------------------------------------------
+Two files are kept: flight.state.A and flight.state.B.
+Writes alternate between A and B (toggled by `_slot_is_a`).
+Each write increments a `version` counter.
+On boot, BOTH files are read; the one with the higher version number and a
+valid magic number is used.
 
-Safety rules (non-negotiable)
-------------------------------
-- `drogue_fired=True` in .state → drogue channel is LOCKED OUT. Cannot re-fire.
-- `drogue_fired=False` in .state → normal operation.
-- If .state timestamp > MAX_STATE_AGE_S old → treat as cold start (stale file).
-- If .state file is corrupt/missing → treat as cold start.
+If power is cut during a write, the OTHER slot still has the previous valid
+state — exactly as in the Arduino `recoveryA` / `recoveryB` pattern.
 
-State file format (JSON, one file, atomic overwrite)
------------------------------------------------------
-{
-    "schema_version": 1,
-    "timestamp_utc":  "2026-08-25T14:30:00Z",
-    "timestamp_mono": 12345.67,          # monotonic seconds since Pi boot
-    "flight_state":   "GUIDED_DESCENT",
-    "ground_altitude_m": 560.3,          # MSL altitude of launch pad (m)
-    "drogue_fired":   true,              # SAFETY LOCK — never re-fire if true
-    "last_altitude_m": 320.1,            # last known AGL altitude
-    "last_velocity_ms": -3.2,            # last known vertical velocity
-    "target_lat":     18.5204,           # mission target
-    "target_lon":     73.8567,
-    "rl_active":      true               # whether RL was active at crash
-}
+Key constants matching Arduino payload code
+-------------------------------------------
+  RECOVERY_MAGIC         = 0xDEAD1234   (same as Arduino)
+  RECOVERY_THRESHOLD_SEC = 300          (same as Arduino RECOVERY_THRESHOLD_SEC)
+  STATE_WRITE_INTERVAL_S = 5            (equivalent to Arduino RECOVERY_LOG_HZ=10)
+
+State file format (JSON, not binary — Pi has plenty of CPU for JSON parsing)
 """
 
 from __future__ import annotations
@@ -55,13 +41,21 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants — matched to Arduino payload code
 # ---------------------------------------------------------------------------
 
-STATE_FILE_PATH       = Path("flight.state")   # written to cwd (glider_gnc/)
-STATE_WRITE_INTERVAL_S = 5.0                   # write every 5 seconds in flight
-MAX_STATE_AGE_S        = 120.0                 # ignore .state files older than 2 min
-SCHEMA_VERSION         = 1
+RECOVERY_MAGIC          = 0xDEAD1234   # same magic as Arduino
+RECOVERY_THRESHOLD_SEC  = 300          # 5 minutes — same as Arduino
+STATE_WRITE_INTERVAL_S  = 5.0          # write every 5 s (equivalent to Arduino 10 Hz)
+SCHEMA_VERSION          = 2            # bump if struct layout changes
+
+# A/B slot file paths
+_SLOT_A = Path("flight.state.A")
+_SLOT_B = Path("flight.state.B")
+
+# Module-level slot tracker (toggled on every write, same as Arduino recoverySlotA)
+_slot_is_a: bool = True
+_version:   int  = 0
 
 
 # ---------------------------------------------------------------------------
@@ -70,115 +64,168 @@ SCHEMA_VERSION         = 1
 
 @dataclass
 class StateSnapshot:
-    """All variables needed to resume flight after a reboot."""
+    """All variables needed to resume flight after a reboot.
 
-    # Core state
-    flight_state:      str    # "BOOT" | "GUIDED_DESCENT" | "FLARE" | "LANDED"
-    ground_altitude_m: float  # MSL altitude of launch pad (for EKF reference)
+    Mirrors the Arduino RecoveryState struct fields that are relevant to
+    the Python GNC system.
+    """
+    # Core state (FlightState enum name as string, same as Arduino stateName())
+    flight_state:      str
+    ground_altitude_m: float   # MSL ground reference (same as Arduino base pressure ref)
 
     # Safety locks — NEVER allow re-fire if True
+    # Equivalent to Arduino `mainDeployed` flag
     drogue_fired: bool
 
-    # Last known kinematics
-    last_altitude_m:  float   # AGL altitude at time of crash
-    last_velocity_ms: float   # vertical velocity (m/s) at time of crash
+    # Last known kinematics (same as Arduino currentAltitude, currentVelocity)
+    last_altitude_m:  float
+    last_velocity_ms: float
 
-    # Mission target
+    # Mission target coordinates
     target_lat: float
     target_lon: float
 
     # Controller state
     rl_active: bool
 
-    # Timestamps (filled automatically by write_state)
+    # Recovery bookkeeping (filled by write_state)
+    magic:          int   = RECOVERY_MAGIC
+    version:        int   = 0
+    schema_version: int   = SCHEMA_VERSION
     timestamp_utc:  str   = ""
     timestamp_mono: float = 0.0
-    schema_version: int   = SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
-# Write
+# Write — dual A/B slot
 # ---------------------------------------------------------------------------
 
-def write_state(snapshot: StateSnapshot, path: Path = STATE_FILE_PATH) -> None:
+def write_state(snapshot: StateSnapshot,
+                slot_a: Path = _SLOT_A,
+                slot_b: Path = _SLOT_B) -> None:
     """
-    Atomically write snapshot to .state file.
+    Write snapshot to the INACTIVE slot, then toggle the active slot.
 
-    Uses write-to-temp + rename pattern to prevent partial writes
-    (a power cut during write leaves the old file intact).
+    Pattern mirrors Arduino saveRecoveryState():
+        File& f = recoverySlotA ? recoveryA : recoveryB;
+        f.seek(0);
+        f.write(...);
+        recoverySlotA = !recoverySlotA;
     """
+    global _slot_is_a, _version
+
+    _version        += 1
+    snapshot.version = _version
     snapshot.timestamp_utc  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     snapshot.timestamp_mono = time.monotonic()
+    snapshot.magic          = RECOVERY_MAGIC
+    snapshot.schema_version = SCHEMA_VERSION
 
-    tmp_path = path.with_suffix(".state.tmp")
+    # Write to the current slot (same as Arduino writing to recoverySlotA ? A : B)
+    target = slot_a if _slot_is_a else slot_b
+    tmp    = target.with_suffix(".tmp")
+
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(asdict(snapshot), f, indent=2)
-        os.replace(tmp_path, path)   # atomic on Linux/POSIX
-        logger.debug("State written: %s  drogue=%s  alt=%.1f m",
-                     snapshot.flight_state, snapshot.drogue_fired,
-                     snapshot.last_altitude_m)
+        os.replace(tmp, target)   # atomic rename (POSIX)
+        logger.debug("State v%d written to slot %s  drogue=%s  alt=%.1f m",
+                     _version, "A" if _slot_is_a else "B",
+                     snapshot.drogue_fired, snapshot.last_altitude_m)
     except Exception as e:
-        logger.warning("Failed to write .state file: %s", e)
+        logger.warning("Failed to write .state slot %s: %s",
+                       "A" if _slot_is_a else "B", e)
         try:
-            tmp_path.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
         except Exception:
             pass
 
+    # Toggle slot — same as `recoverySlotA = !recoverySlotA`
+    _slot_is_a = not _slot_is_a
+
 
 # ---------------------------------------------------------------------------
-# Load
+# Load — reads both slots, picks highest valid version (same as Arduino)
 # ---------------------------------------------------------------------------
 
-def load_state(path: Path = STATE_FILE_PATH) -> Optional[StateSnapshot]:
+def load_state(slot_a: Path = _SLOT_A,
+               slot_b: Path = _SLOT_B) -> Optional[StateSnapshot]:
     """
-    Load .state file and return a StateSnapshot if valid and fresh.
+    Read both A and B slots. Return the snapshot with the higher version
+    number that passes all validation checks.
 
-    Returns None if:
-      - File does not exist         → cold start
-      - File is corrupt / bad JSON  → cold start
-      - Schema version mismatch     → cold start
-      - Timestamp older than MAX_STATE_AGE_S → stale, cold start
+    Mirrors Arduino attemptRecovery():
+        if (validA && validB)   chosen = (rsA.version >= rsB.version) ? &rsA : &rsB;
+        else if (validA)        chosen = &rsA;
+        else if (validB)        chosen = &rsB;
+        else                    return false;
     """
+    snap_a = _load_slot(slot_a, "A")
+    snap_b = _load_slot(slot_b, "B")
+
+    # Pick highest valid version (same as Arduino logic)
+    if snap_a is not None and snap_b is not None:
+        chosen = snap_a if snap_a.version >= snap_b.version else snap_b
+        slot_label = "A" if chosen is snap_a else "B"
+    elif snap_a is not None:
+        chosen, slot_label = snap_a, "A"
+    elif snap_b is not None:
+        chosen, slot_label = snap_b, "B"
+    else:
+        logger.info("No valid .state slots found — cold start.")
+        return None
+
+    # Age check — matches Arduino `elapsed > RECOVERY_THRESHOLD_SEC`
+    try:
+        saved_at = datetime.strptime(
+            chosen.timestamp_utc, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - saved_at).total_seconds()
+    except Exception:
+        logger.warning(".state has bad timestamp — cold start.")
+        return None
+
+    if age_s > RECOVERY_THRESHOLD_SEC:
+        logger.info(".state slot %s is %.0f s old (max %d s) — stale, cold start.",
+                    slot_label, age_s, RECOVERY_THRESHOLD_SEC)
+        return None
+
+    logger.info(
+        "[RECOVERY] Slot %s v%d: state=%s  drogue=%s  alt=%.1f m  age=%.0f s",
+        slot_label, chosen.version, chosen.flight_state,
+        chosen.drogue_fired, chosen.last_altitude_m, age_s,
+    )
+    return chosen
+
+
+def _load_slot(path: Path, label: str) -> Optional[StateSnapshot]:
+    """Load and validate one slot file. Returns None on any failure."""
     if not path.exists():
-        logger.info("No .state file found — cold start.")
         return None
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        logger.warning(".state file corrupt (%s) — cold start.", e)
-        _archive_bad_state(path)
+        logger.warning(".state slot %s corrupt (%s)", label, e)
+        _archive_bad(path, label)
         return None
 
-    # Schema check
+    # Magic number check — same as Arduino `rs.magic != RECOVERY_MAGIC`
+    if data.get("magic") != RECOVERY_MAGIC:
+        logger.warning(".state slot %s bad magic (got %s)", label, data.get("magic"))
+        _archive_bad(path, label)
+        return None
+
+    # Schema version check
     if data.get("schema_version") != SCHEMA_VERSION:
-        logger.warning(".state schema version mismatch (got %s, want %s) — cold start.",
-                       data.get("schema_version"), SCHEMA_VERSION)
-        _archive_bad_state(path)
+        logger.warning(".state slot %s schema mismatch (got %s, want %s)",
+                       label, data.get("schema_version"), SCHEMA_VERSION)
+        _archive_bad(path, label)
         return None
 
-    # Age check — use wall-clock difference vs stored UTC timestamp
     try:
-        saved_at = datetime.strptime(
-            data["timestamp_utc"], "%Y-%m-%dT%H:%M:%SZ"
-        ).replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(timezone.utc) - saved_at).total_seconds()
-    except Exception:
-        logger.warning(".state has bad timestamp — cold start.")
-        _archive_bad_state(path)
-        return None
-
-    if age_s > MAX_STATE_AGE_S:
-        logger.info(".state is %.0f s old (max %.0f s) — stale, cold start.",
-                    age_s, MAX_STATE_AGE_S)
-        _archive_bad_state(path)
-        return None
-
-    # Build snapshot
-    try:
-        snapshot = StateSnapshot(
+        return StateSnapshot(
             flight_state      = str(data["flight_state"]),
             ground_altitude_m = float(data["ground_altitude_m"]),
             drogue_fired      = bool(data["drogue_fired"]),
@@ -187,72 +234,77 @@ def load_state(path: Path = STATE_FILE_PATH) -> Optional[StateSnapshot]:
             target_lat        = float(data["target_lat"]),
             target_lon        = float(data["target_lon"]),
             rl_active         = bool(data["rl_active"]),
-            timestamp_utc     = data["timestamp_utc"],
-            timestamp_mono    = float(data["timestamp_mono"]),
+            magic             = int(data["magic"]),
+            version           = int(data["version"]),
             schema_version    = int(data["schema_version"]),
+            timestamp_utc     = str(data["timestamp_utc"]),
+            timestamp_mono    = float(data["timestamp_mono"]),
         )
     except (KeyError, TypeError, ValueError) as e:
-        logger.warning(".state missing field (%s) — cold start.", e)
-        _archive_bad_state(path)
+        logger.warning(".state slot %s missing field: %s", label, e)
+        _archive_bad(path, label)
         return None
-
-    logger.info(
-        "Recovered .state: state=%s  drogue=%s  alt=%.1f m  age=%.1f s",
-        snapshot.flight_state, snapshot.drogue_fired,
-        snapshot.last_altitude_m, age_s,
-    )
-    return snapshot
 
 
 # ---------------------------------------------------------------------------
 # Delete / Archive
 # ---------------------------------------------------------------------------
 
-def delete_state(path: Path = STATE_FILE_PATH) -> None:
-    """Remove the .state file on clean landing (no stale recovery next boot)."""
-    try:
-        path.unlink(missing_ok=True)
-        logger.info(".state file deleted (clean landing).")
-    except Exception as e:
-        logger.warning("Could not delete .state file: %s", e)
+def delete_state(slot_a: Path = _SLOT_A, slot_b: Path = _SLOT_B) -> None:
+    """Delete both slots on clean landing — no stale recovery on next boot.
+
+    Mirrors Arduino clearing the recovery files after normal LANDED state.
+    """
+    for p, label in [(slot_a, "A"), (slot_b, "B")]:
+        try:
+            p.unlink(missing_ok=True)
+            logger.info(".state slot %s deleted (clean landing).", label)
+        except Exception as e:
+            logger.warning("Could not delete .state slot %s: %s", label, e)
 
 
-def _archive_bad_state(path: Path) -> None:
-    """Rename bad .state file to .state.bad for post-flight inspection."""
-    bad_path = path.with_suffix(".state.bad")
+def _archive_bad(path: Path, label: str) -> None:
+    """Rename bad slot to .bad for post-flight inspection."""
+    bad = path.with_suffix(f".{label}.bad")
     try:
-        os.replace(path, bad_path)
-        logger.info("Bad .state archived to %s", bad_path)
+        os.replace(path, bad)
+        logger.info("Bad slot %s archived to %s", label, bad)
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Parser / viewer (run standalone to inspect a .state file)
+# Standalone viewer — `python -m state_machine.state_persistence`
 # ---------------------------------------------------------------------------
 
-def print_state_file(path: Path = STATE_FILE_PATH) -> None:
-    """Pretty-print the .state file for ground crew inspection."""
-    snapshot = load_state(path)
-    if snapshot is None:
-        print(f"No valid .state file at {path}")
-        return
+def print_state_files() -> None:
+    """Pretty-print both A/B slots for ground crew inspection."""
+    print("=" * 50)
+    print("  GARUD FLIGHT STATE RECOVERY FILES")
+    print("=" * 50)
+    for path, label in [(_SLOT_A, "A"), (_SLOT_B, "B")]:
+        snap = _load_slot(path, label)
+        if snap is None:
+            print(f"  Slot {label}: NOT FOUND or INVALID")
+            continue
+        print(f"  Slot {label} — version {snap.version}")
+        print(f"    Saved at     : {snap.timestamp_utc}")
+        print(f"    Flight state : {snap.flight_state}")
+        print(f"    Ground alt   : {snap.ground_altitude_m:.1f} m MSL")
+        print(f"    Last alt AGL : {snap.last_altitude_m:.1f} m")
+        print(f"    Last velocity: {snap.last_velocity_ms:.2f} m/s")
+        print(f"    Drogue fired : {'YES — LOCKED OUT' if snap.drogue_fired else 'No'}")
+        print(f"    Target       : {snap.target_lat:.6f}, {snap.target_lon:.6f}")
+        print(f"    RL active    : {snap.rl_active}")
+    print("=" * 50)
 
-    print("=" * 45)
-    print("  GARUD FLIGHT STATE SNAPSHOT")
-    print("=" * 45)
-    print(f"  Saved at       : {snapshot.timestamp_utc}")
-    print(f"  Flight state   : {snapshot.flight_state}")
-    print(f"  Ground alt MSL : {snapshot.ground_altitude_m:.1f} m")
-    print(f"  Last alt AGL   : {snapshot.last_altitude_m:.1f} m")
-    print(f"  Last velocity  : {snapshot.last_velocity_ms:.2f} m/s")
-    print(f"  Drogue fired   : {'YES — LOCKED OUT' if snapshot.drogue_fired else 'No'}")
-    print(f"  Target         : {snapshot.target_lat:.6f}, {snapshot.target_lon:.6f}")
-    print(f"  RL was active  : {snapshot.rl_active}")
-    print("=" * 45)
+    # Show which would be chosen on recovery
+    chosen = load_state()
+    if chosen:
+        print(f"  → Would recover to: {chosen.flight_state} (v{chosen.version})")
+    else:
+        print("  → Would cold start (no valid/fresh slot)")
 
 
 if __name__ == "__main__":
-    import sys
-    p = Path(sys.argv[1]) if len(sys.argv) > 1 else STATE_FILE_PATH
-    print_state_file(p)
+    print_state_files()

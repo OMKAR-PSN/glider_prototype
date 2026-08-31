@@ -1,0 +1,39 @@
+============================================================================
+GARUD Actuation Algorithm -- Full Verification Report
+Dataset : HuggingFace UAV-SEAD (real PX4 indoor flights)
+Target  : NED (100.0m N, 50.0m E)
+Date    : 2026-08-27 20:14:10
+============================================================================
+
+Log                           Rows  Servo     dA    NaN   Sign   MeanErr
+----------------------------------------------------------------------------
+18_01_59                       497   PASS   PASS   PASS   PASS    63.62deg
+18_05_54                      1089   PASS   PASS   PASS   PASS    65.53deg
+18_09_57                      1040   PASS   PASS   PASS   PASS    65.57deg
+18_13_16                        56   PASS   PASS   PASS   PASS    63.40deg
+18_15_21                       338   PASS   PASS   PASS   PASS    63.93deg
+18_17_58                      1199   PASS   PASS   PASS   PASS    65.36deg
+18_21_53                       522   PASS   PASS   PASS   PASS    64.45deg
+18_25_07                      1291   PASS   PASS   PASS   PASS    65.66deg
+18_33_02                      1776   PASS   PASS   PASS   PASS    66.21deg
+18_36_56                      1211   PASS   PASS   PASS   PASS    66.82deg
+----------------------------------------------------------------------------
+
+OVERALL RESULT: ALL PASS
+
+Verification checks:
+  servo    : servo_left and servo_right within [60, 120] deg
+  delta_a  : AGC output within [-30, +30] deg
+  no_nan   : no NaN or Inf in any output
+  sign     : delta_a sign consistent with heading error sign
+
+Outputs saved to: tests/results/
+  trajectory_map.png      -- NED flight paths, error coloured
+  heading_error_ts.png    -- heading error over time
+  servo_angles_ts.png     -- left/right servo over time
+  delta_a_vs_error.png    -- tanh nonlinearity verification
+  agc_gain_vs_crosswind.png -- wind-adaptive gain
+  servo_histogram.png     -- servo angle distributions
+  combined_dashboard.png  -- 3x3 full overview
+  actuation_results.csv   -- all computed values
+  summary_report.txt      -- this file
