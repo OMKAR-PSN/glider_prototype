@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from sim.run_sim import SimRunner
 from sim.dynamics import SimPhase
 
 from sim.scenario_validator import check_scenario_reachability
@@ -94,6 +93,7 @@ def run_monte_carlo(num_drops: int = 500, use_rl: bool = False, model_path: str 
             miss_distances.append(dist)
             
         else:
+            from sim.run_sim import SimRunner
             runner = SimRunner()
             runner.dynamics.x = initial_x
             runner.dynamics.y = initial_y

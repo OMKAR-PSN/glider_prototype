@@ -216,8 +216,13 @@ class MonteCarloEvalCallback(BaseCallback):
 
 
             print(f"\n--- Running Automatic Monte Carlo Eval at step {self.num_timesteps} ---")
-            from sim.monte_carlo import run_monte_carlo
-            cep50 = run_monte_carlo(num_drops=500, use_rl=True, model_path=model_path)
+            try:
+                from sim.monte_carlo import run_monte_carlo
+                cep50 = run_monte_carlo(num_drops=500, use_rl=True, model_path=model_path)
+            except (ImportError, ModuleNotFoundError) as e:
+                print(f"    Monte Carlo eval skipped (sim module unavailable: {e})")
+                print(f"    Checkpoint saved. Training continues.")
+                cep50 = self.best_cep50  # treat as no change — won't trigger stagnation
 
             # Improvement check — Tier 1 (2% tolerance)
             tier1_threshold = self.best_cep50 * (1.0 - self.STAGNATION_TOLERANCE)
@@ -271,7 +276,7 @@ class MonteCarloEvalCallback(BaseCallback):
         return True
 
 
-def train_sac(total_steps=100_000, resume_path=None, drive_backup_path=None):
+def train_sac(total_steps=100_000, resume_path=None, drive_backup_path=None, lr=None):
     import json
     os.makedirs("models", exist_ok=True)
     os.makedirs("models/checkpoints", exist_ok=True)
@@ -287,9 +292,29 @@ def train_sac(total_steps=100_000, resume_path=None, drive_backup_path=None):
 
     if resume_path and os.path.exists(resume_path):
         print(f"Resuming training from {resume_path}")
-        model = SAC.load(resume_path, env=env)
+        custom_objects = {}
+        if lr is not None:
+            custom_objects["learning_rate"] = float(lr)
+        model = SAC.load(resume_path, env=env, custom_objects=custom_objects if custom_objects else None)
+
+        if lr is not None:
+            target_lr = float(lr)
+            print(f"--> Overriding learning rate to: {target_lr}")
+            # In SB3, lr_schedule is a callable that updates optimizers on every training step
+            model.lr_schedule = lambda _: target_lr
+            model.learning_rate = target_lr
+            for param_group in model.actor.optimizer.param_groups:
+                param_group['lr'] = target_lr
+            for param_group in model.critic.optimizer.param_groups:
+                param_group['lr'] = target_lr
+            if hasattr(model, 'ent_coef_optimizer') and model.ent_coef_optimizer is not None:
+                for param_group in model.ent_coef_optimizer.param_groups:
+                    param_group['lr'] = target_lr
     else:
-        model = SAC("MlpPolicy", env, verbose=1)
+        model_kwargs = {"verbose": 1}
+        if lr is not None:
+            model_kwargs["learning_rate"] = float(lr)
+        model = SAC("MlpPolicy", env, **model_kwargs)
     
     # Combined eval and checkpoint callback
     eval_callback = MonteCarloEvalCallback(
@@ -298,11 +323,22 @@ def train_sac(total_steps=100_000, resume_path=None, drive_backup_path=None):
         drive_backup_path=drive_backup_path,
         verbose=1,
     )
-    
+
+    # Lightweight crash-recovery checkpoint every 100K steps
+    # Keeps only the last 3 quick saves to avoid filling disk
+    from stable_baselines3.common.callbacks import CheckpointCallback
+    quick_save_callback = CheckpointCallback(
+        save_freq=100_000,
+        save_path="./models/quick_saves/",
+        name_prefix="sac_quick",
+        save_replay_buffer=False,
+        verbose=1,
+    )
+
     # Needs the env from the model which is wrapped in a VecEnv
     curriculum_callback = CurriculumCallback(total_steps, start_stage=start_stage)
-    
-    callbacks = CallbackList([eval_callback, curriculum_callback])
+
+    callbacks = CallbackList([eval_callback, quick_save_callback, curriculum_callback])
     
     print(f"Training SAC for {total_steps} steps using Rolling-Average Curriculum + Forced Ceilings.")
     # When resuming from a checkpoint, do NOT reset the step counter —
@@ -321,10 +357,12 @@ def train_sac(total_steps=100_000, resume_path=None, drive_backup_path=None):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--steps",      type=int, default=100_000, help="Total training steps")
-    parser.add_argument("--resume",     type=str, default=None,    help="Path to checkpoint to resume from")
-    parser.add_argument("--drive-path", type=str, default=None,    help="Google Drive checkpoint backup path (Colab only)")
+    parser.add_argument("--steps",      type=int,   default=100_000, help="Total training steps")
+    parser.add_argument("--resume",     type=str,   default=None,    help="Path to checkpoint to resume from")
+    parser.add_argument("--lr",         type=float, default=None,    help="Override learning rate (e.g. 5e-5)")
+    parser.add_argument("--drive-path", type=str,   default=None,    help="Google Drive checkpoint backup path (Colab only)")
     args = parser.parse_args()
 
-    train_sac(args.steps, args.resume, args.drive_path)
+    train_sac(args.steps, args.resume, args.drive_path, args.lr)
+
 

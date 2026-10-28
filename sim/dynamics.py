@@ -89,13 +89,16 @@ class GliderDynamics:
             
             # K_turn relates asymmetric brake (deg) to yaw rate (rad/s)
             # Assume max 30 deg brake gives ~30 deg/sec turn rate (0.5 rad/s)
-            K_turn = 0.5 / 30.0 
+            K_turn = (0.5 / 30.0) * (12.0 / max(self.airspeed, 6.0))
             cmd_yaw_rate = K_turn * delta_a_deg
             
             # Simple first-order response for yaw rate
-            self.yaw_rate += (cmd_yaw_rate - self.yaw_rate) * dt * 5.0
+            self.yaw_rate += (cmd_yaw_rate - self.yaw_rate) * dt * 2.0
             
+            import numpy as np
+
             self.heading += self.yaw_rate * dt
+            self.heading += np.random.normal(0, 0.01)  # ±0.01 rad sensor noise
             self.heading = (self.heading + math.pi) % (2*math.pi) - math.pi
             
             # Roll and pitch are damped by the pendulum effect of the payload

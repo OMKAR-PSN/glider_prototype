@@ -190,7 +190,7 @@ class FlightComputer:
         _ground_alt         = self.baro.read_altitude()   # read ONCE — shared reference
         self.ekf_alt        = EKFAltitude(self.dt, initial_alt=_ground_alt)
         self.heading_pid    = HeadingPID(kp=10.0, ki=0.1, kd=1.0, output_limit=30.0)
-        self.state_machine  = StateMachine(ground_altitude=_ground_alt)
+        self.state_machine  = StateMachine(ground_altitude=_ground_alt - drop_height)
         self.wind_estimator = WindEstimatorRLS()
         self.prev_delta_a   = 0.0
         self.prev_delta_s   = 0.0
@@ -494,8 +494,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="CAN-7U-SAT Flight Computer")
     parser.add_argument("--sitl", action="store_true", help="Run in SITL mode")
+    parser.add_argument("--drop-height", type=float, default=0.0, help="Simulate a drop test from this height in meters")
     args = parser.parse_args()
-    fc = FlightComputer(use_simulator=args.sitl)
+    fc = FlightComputer(use_simulator=args.sitl, drop_height=args.drop_height)
     try:
         fc.run()
     except KeyboardInterrupt:

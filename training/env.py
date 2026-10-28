@@ -23,15 +23,16 @@ class GliderEnv(gym.Env):
         # Actions: [delta_a (asymmetric brake -30 to 30), delta_s (symmetric brake 0 to 30)]
         self.action_space = spaces.Box(low=np.array([-30.0, 0.0]), high=np.array([30.0, 30.0]), dtype=np.float32)
         
-        # Obs (16 dims): [sin(heading_err), cos(heading_err), dist, alt_excess, wind_speed,
+        # Obs (17 dims): [sin(heading_err), cos(heading_err), dist, alt_excess, wind_speed,
         #                  sin(wind_dir), cos(wind_dir), pitch, roll, yaw_rate,
         #                  prev_delta_a, prev_delta_s,
-        #                  sin(track_err), cos(track_err), lateral_drift, time_to_impact]
+        #                  sin(track_err), cos(track_err), lateral_drift, time_to_impact, raw_altitude]
         #
         # track_err    = bearing(target) - course_over_ground (sin/cos to avoid angle wrap)
         # lateral_drift = ground_velocity component perpendicular to target bearing / 8.0
         # time_to_impact = altitude / sink_rate / 200.0
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(16,), dtype=np.float32)
+        # raw_altitude = altitude / 600.0 (0=ground, 1=deployment)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(17,), dtype=np.float32)
         
         self.reset()
 
@@ -115,7 +116,7 @@ class GliderEnv(gym.Env):
         time_to_impact = self.dynamics.altitude / sink_rate
         time_to_impact_norm = min(time_to_impact / 200.0, 2.0)  # cap at 2.0 for edge cases
         
-        # 16-dimensional observation
+        # 17-dimensional observation
         return np.array([
             math.sin(heading_err),            # obs[0]  heading error (sin)
             math.cos(heading_err),            # obs[1]  heading error (cos)
@@ -133,6 +134,7 @@ class GliderEnv(gym.Env):
             math.cos(track_err),              # obs[13] track error (cos) — COG vs bearing
             lateral_drift_norm,               # obs[14] crosswind drift rate
             time_to_impact_norm,              # obs[15] urgency / time remaining
+            self.dynamics.altitude / 600.0,   # obs[16] normalized raw altitude (0=ground, 1=deployment)
         ], dtype=np.float32)
 
     def step(self, action):
@@ -159,7 +161,7 @@ class GliderEnv(gym.Env):
         self.previous_distance = dist_meters
         
         # Fix 4: Action smoothness penalty (scaled down for 20Hz dt)
-        action_delta_penalty = 0.025 * np.sum(np.abs(action - self.previous_action))
+        action_delta_penalty = 0.15 * np.sum(np.abs(action - self.previous_action))
         reward -= action_delta_penalty
         
         self.previous_action = action.copy()
@@ -171,13 +173,21 @@ class GliderEnv(gym.Env):
         
         if self.dynamics.altitude <= 0:
             terminated = True
-            # Massive Sparse terminal bonuses
-            if dist_meters < 10.0:
-                reward += 10000.0
+            # Tiered terminal accuracy bonuses — sharper curve to incentivize precision
+            if dist_meters < 5.0:
+                reward += 1000.0   # Bullseye
+            elif dist_meters < 10.0:
+                reward += 700.0
             elif dist_meters < 20.0:
-                reward += 2000.0
+                reward += 400.0
             elif dist_meters < 50.0:
-                reward += 200.0
+                reward += 100.0
+            elif dist_meters < 100.0:
+                reward += 0.0      # Neutral — no bonus for mediocre landing
+            else:
+                # Exponential miss penalty: the farther the miss, the worse
+                # At 200m miss → -200 penalty, at 500m miss → -500 penalty
+                reward -= min(dist_meters, 800.0)
                 
         if self.step_count >= self.max_steps:
             truncated = True
